@@ -5,247 +5,286 @@
 
 AX_NAMESPACE
 
-struct alignas(16) Quaternion
+typedef vec_t Quaternion;
+struct xyzw { float x, y, z, w; };
+
+#define QIdentity()  VecSetR(0.0f, 0.0f, 0.0f, 1.0f)
+#define QNorm(q)     VecNorm(q)
+#define QNormEst(q)  VecNormEst(q)
+#define MakeQuat(_x, _y, _z, _w)  VecSetR(_x, _y, _z, _w)
+
+inline vec_t VECTORCALL QMul(vec_t Q1, vec_t Q2) 
 {
-    union
+    const vec_t ControlWZYX = { 1.0f,-1.0f, 1.0f,-1.0f };
+    const vec_t ControlZWXY = { 1.0f, 1.0f,-1.0f,-1.0f };
+    const vec_t ControlYXWZ = { -1.0f, 1.0f, 1.0f,-1.0f };
+    
+    vec_t vResult = VecSplatW(Q2);
+    vec_t Q2X     = VecSplatX(Q2);
+    vec_t Q2Y     = VecSplatY(Q2);
+    vec_t Q2Z     = VecSplatZ(Q2);
+    vResult = VecMul(vResult, Q1);
+
+    vec_t Q1Shuffle = Q1;
+    Q1Shuffle = VecRev(Q1Shuffle);
+    Q2X       = VecMul(Q2X, Q1Shuffle);
+    Q1Shuffle = VecShuffleR(Q1Shuffle, Q1Shuffle, 2, 3, 0, 1);
+    Q2X       = VecMul(Q2X, ControlWZYX);
+    Q2Y       = VecMul(Q2Y, Q1Shuffle);
+    Q1Shuffle = VecRev(Q1Shuffle);
+    Q2Y       = VecMul(Q2Y, ControlZWXY);
+    Q2Z       = VecMul(Q2Z, Q1Shuffle);
+    vResult   = VecAdd(vResult, Q2X);
+    Q2Z       = VecMul(Q2Z, ControlYXWZ);
+    Q2Y       = VecAdd(Q2Y, Q2Z);
+    vResult   = VecAdd(vResult, Q2Y);
+    return vResult;
+}
+
+// Angle should be between -twopi, twopi
+inline vec_t QFromAxisAngle(Vector3f axis, float angle)
+{
+    float SinV = Sin(0.5f * angle);
+    float CosV = Cos(0.5f * angle);
+    vec_t q = VecSetR(axis.x * SinV, axis.y * SinV, axis.z * SinV, CosV);
+    return QNorm(q);
+}
+
+// below 3 function are same as QFromAxisAngle but with single axis, 
+// faster because no normalization and less multipication
+inline vec_t QFromXAngle(float angle) {
+    return VecSetR(Sin(0.5f * angle), 0.0f, 0.0f, Cos(0.5f * angle));
+}
+
+inline vec_t QFromYAngle(float angle) {
+    return VecSetR(0.0f, Sin(0.5f * angle), 0.0f, Cos(0.5f * angle));
+}
+
+inline vec_t QFromZAngle(float angle) {
+    return VecSetR(0.0f, 0.0f, Sin(0.5f * angle), Cos(0.5f * angle));
+}
+
+inline vec_t VECTORCALL QMulVec3(vec_t vec, vec_t quat)
+{
+    vec_t temp0 = Vec3Cross(quat, vec);
+    vec_t temp1 = VecMul(vec, VecSplatZ(quat));
+    temp0 = VecAdd(temp0, temp1);
+    temp1 = VecMul(Vec3Cross(quat, temp0), VecSet1(2.0f));
+    return VecAdd(vec, temp1);
+}
+
+inline Vector3f VECTORCALL QMulVec3(Vector3f vec, Quaternion quat)
+{
+    Vector3f res;
+    Vec3Store(&res.x, QMulVec3(VecSetR(vec.x, vec.y, vec.z, 1.0f), quat));
+    return res;
+}
+
+inline Quaternion VECTORCALL QSlerp(Quaternion q0, Quaternion q1, float t)
+{
+    const vec_t one = VecSet1(1.0f);
+    // from paper: "A Fast and Accurate Estimate for SLERP" by David Eberly
+    // but I have used fused instructions and I've made optimizations on sign part for ARM cpu's
+
+    // Common code for computing the scalar coefficients of SLERP
+    auto CalculateCoefficient = [one] (vec_t vT, vec_t xm1)
     {
-        struct { float x, y, z, w; };
-        struct { float arr[4]; };
-        struct { vec_t vec; };
+        constexpr float const mu = 1.85298109240830f;
+        // Precomputed constants
+        const vec_t u0123 = VecSetR( 1.f / ( 1 * 3 ), 1.f / ( 2 * 5 ), 1.f / ( 3 * 7 ), 1.f / ( 4 * 9 ) );
+        const vec_t u4567 = VecSetR( 1.f / ( 5 * 11 ), 1.f / ( 6 * 13 ), 1.f / ( 7 * 15 ), mu / ( 8 * 17 ) );
+        const vec_t v0123 = VecSetR( 1.f / 3, 2.f / 5, 3.f / 7, 4.f / 9 );
+        const vec_t v4567 = VecSetR( 5.f / 11, 6.f / 13, 7.f / 15, mu * 8 / 17 );
+
+        vec_t vTSquared = VecMul(vT, vT);
+        vec_t b4567 = VecFmsub(u4567, vTSquared, v4567);
+        b4567 = VecMul(b4567, xm1);
+
+        vec_t c = VecAdd(VecSplatW(b4567), one);
+        c = VecFmaddLane(c, b4567, one, 2); // multiply by lane is faster with ARM cpu's
+        c = VecFmaddLane(c, b4567, one, 1);
+        c = VecFmaddLane(c, b4567, one, 0);
+
+        vec_t b0123 = VecFmsub(u0123, vTSquared, v0123);
+        b0123 = VecMul(b0123, xm1);
+        c = VecFmaddLane(c, b0123, one, 3);
+        c = VecFmaddLane(c, b0123, one, 2);
+        c = VecFmaddLane(c, b0123, one, 1);
+        c = VecFmaddLane(c, b0123, one, 0);
+        c = VecMul(c, vT);
+        return c;
     };
+
+    vec_t x = VecDot(q0, q1); // cos ( theta ) in all components
+    vec_t control = VecCmpLt(x, VecZero());
+    vec_t sign = VecSelect(VecOne(), VecNegativeOne(), control);
+    q1 = VecMul(sign, q1); // do mul instead of xor
+
+    vec_t xm1 = VecFmsub(x, sign, one);
+    vec_t cT = CalculateCoefficient(VecSet1(t), xm1);
+    vec_t cD = CalculateCoefficient(VecSet1(1.0f - t), xm1);
+    cT = VecMul(cT, q1);
+    return VecFmadd(cD, q0, cT);
+}
+
+// faster but less precise, more error prone version of slerp
+purefn Quaternion VECTORCALL QNLerp(Quaternion a, Quaternion b, float t)
+{
+    veci_t lz = VecCmpLt(VecDot(a, b), VecZero());
+    a = VecSelect(a, VecNeg(a), lz);
+    a = VecLerp(a, b, t);
+    return VecNormEst(a);
+}
+
+purefn Quaternion QFromEuler(float x, float y, float z)
+{
+    x *= 0.5f; y *= 0.5f; z *= 0.5f;
+    float c[4], s[4];
+    vec_t cv;
+    vec_t sv = VecSinCos(&cv, VecSetR(x, y, z, 1.0f));
+    VecStore(c, cv);
+    VecStore(s, sv);
     
-    const float  operator [] (int index) const { return arr[index]; }
-    float& operator [] (int index) { return arr[index]; }
+    Quaternion q = VecSetR(
+    s[0] * c[1] * c[2] - c[0] * s[1] * s[2],
+    c[0] * s[1] * c[2] + s[0] * c[1] * s[2],
+    c[0] * c[1] * s[2] - s[0] * s[1] * c[2],
+    c[0] * c[1] * c[2] + s[0] * s[1] * s[2]);
+    return q;
+}
+
+purefn Quaternion VECTORCALL QFromEuler(Vector3f euler)
+{
+    return QFromEuler(euler.x, euler.y, euler.z);
+}
+
+inline Vector3f QToEulerAngles(Quaternion qu)
+{
+    xyzw q;
+    VecStore(&q.x, qu);
+    Vector3f eulerAngles; // using cstd for trigonometric functions recommended
+    eulerAngles.x = ATan2(2.0f * (q.y * q.z + q.w * q.x), q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z);
+    eulerAngles.y = ASin(Clamp(-2.0f * (q.x * q.z - q.w * q.y), -1.0f, 1.0f));
+    eulerAngles.z = ATan2(2.0f * (q.x * q.y + q.w * q.z), q.w * q.w + q.x * q.x - q.y * q.y - q.z * q.z);
+    return eulerAngles;
+}
+
+template<int numCol = 4> // number of columns of matrix, 3 or 4
+inline void QuaternionFromMatrix(float* Orientation, const float* m) {
+    int i, j, k = 0;
+    float root, trace = m[0*numCol+0] + m[1 * numCol + 1] + m[2 * numCol + 2];
     
-    __forceinline static Quaternion Identity() 
+    if (trace > 0.0f)
     {
-        return {0.0f, 0.0f, 0.0f, 1.0f};
+        root = Sqrt(trace + 1.0f);
+        Orientation[3] = 0.5f * root;
+        root = 0.5f / root;
+        Orientation[0] = root * (m[1 * numCol + 2] - m[2 * numCol + 1]);
+        Orientation[1] = root * (m[2 * numCol + 0] - m[0 * numCol + 2]);
+        Orientation[2] = root * (m[0 * numCol + 1] - m[1 * numCol + 0]);
     }
-    
-    inline static Quaternion Normalize(Quaternion quat)
+    else
     {
-        quat.vec = VecNorm(quat.vec);
-        return quat;
-    }
-    
-    inline static vec_t VECTORCALL Mul(const vec_t Q1, const vec_t Q2) 
-    {
-        static const vec_t ControlWZYX = { 1.0f,-1.0f, 1.0f,-1.0f };
-        static const vec_t ControlZWXY = { 1.0f, 1.0f,-1.0f,-1.0f };
-        static const vec_t ControlYXWZ = { -1.0f, 1.0f, 1.0f,-1.0f };
-        vec_t Q2X = Q2, Q2Y = Q2, Q2Z = Q2, vResult = Q2;
-        vResult = VecSplatW(vResult);
-        Q2X     = VecSplatX(Q2X);
-        Q2Y     = VecSplatY(Q2Y);
-        Q2Z     = VecSplatZ(Q2Z);
-        vResult = VecMul(vResult, Q1);
-
-        vec_t Q1Shuffle = Q1;
-        Q1Shuffle = VecShuffleR(Q1Shuffle, Q1Shuffle, 0, 1, 2, 3);
-        Q2X       = VecMul(Q2X, Q1Shuffle);
-        Q1Shuffle = VecShuffleR(Q1Shuffle, Q1Shuffle, 2, 3, 0, 1);
-        Q2X       = VecMul(Q2X, ControlWZYX);
-        Q2Y       = VecMul(Q2Y, Q1Shuffle);
-        Q1Shuffle = VecShuffleR(Q1Shuffle, Q1Shuffle, 0, 1, 2, 3);
-        Q2Y       = VecMul(Q2Y, ControlZWXY);
-        Q2Z       = VecMul(Q2Z, Q1Shuffle);
-        vResult   = VecAdd(vResult, Q2X);
-        Q2Z       = VecMul(Q2Z, ControlYXWZ);
-        Q2Y       = VecAdd(Q2Y, Q2Z);
-        vResult   = VecAdd(vResult, Q2Y);
-        return vResult;
-    }
-    
-    inline static Vector3f VECTORCALL MulVec3(Vector3f vec, Quaternion quat)
-    {
-        Vector3f res;
-        Vec3Store(&res.x, MulVec3(VecSetR(vec.x, vec.y, vec.z, 1.0f), quat.vec));
-        return res;
-    }
-    
-    inline static vec_t VECTORCALL MulVec3(vec_t vec, vec_t quat)
-    {
-        vec_t temp0 = Vec3Cross(quat, vec);
-        vec_t temp1 = VecMul(vec, VecSplatZ(quat));
-        temp0 = VecAdd(temp0, temp1);
-        temp1 = VecMul(Vec3Cross(quat, temp0), VecSet1(2.0f));
-        return VecAdd(vec, temp1);
-    }
-    
-    inline Quaternion VECTORCALL Slerp(const Quaternion Q0, const Quaternion Q1, float t)
-    {
-        const vec_t T = VecSet1(t);
-		// Result = Q0 * sin((1.0 - t) * Omega) / sin(Omega) + Q1 * sin(t * Omega) / sin(Omega)
-		static const vec_t OneMINusEpsilon = VecSetR(1.0f - 0.00001f, 1.0f - 0.00001f, 1.0f - 0.00001f, 1.0f - 0.00001f);
-		static const veci_t SignMask2 = VecFromInt(0x80000000, 0x00000000, 0x00000000, 0x00000000);
-
-		vec_t CosOmega = VecDot(Q0.vec, Q1.vec);
-
-		const vec_t Zero = VecZero();
-		vec_t Control = VecCmpLt(CosOmega, Zero);
-		vec_t Sign = VecSelect(VecOne(), VecNegativeOne(), Control);
-		CosOmega = VecMul(CosOmega, Sign);
-		Control = VecCmpLt(CosOmega, OneMINusEpsilon);
-
-		vec_t SinOmega = VecMul(CosOmega, CosOmega);
-		SinOmega = VecSub(VecOne(), SinOmega);
-		SinOmega = VecSqrt(SinOmega);
-
-		vec_t Omega = VecAtan2(SinOmega, CosOmega);
-		vec_t V01 = VecSwizzle(T, 2, 3, 0, 1);
-		V01 = VecAnd(V01, VecMaskXY);
-        #if !defined(AX_SUPPORT_SSE) && !defined(AX_ARM)
-		uint uf = BitCast<uint>(V01.x) ^ 0x80000000;              
-		V01.x = BitCast<float>(uf);    
-        #else
-		V01 = VecXor(V01, SignMask2);
-        #endif
-		V01 = VecAdd(VecIdentityR0, V01);
-
-		vec_t S0 = VecMul(V01, Omega);
-		S0 = VecSin(S0);
-		S0 = VecDiv(S0, SinOmega);
-		S0 = VecSelect(V01, S0, Control);
-
-		vec_t S1 = VecSplatY(S0);
-		S0 = VecSplatX(S0);
-		S1 = VecMul(S1, Sign);
-
-		vec_t Result = VecMul(Q0.vec, S0);
-		S1 = VecMul(S1, Q1.vec); // _mm_fmadd_ps(S1, Q1.vec, Result) ?
-		Quaternion res;
-		res.vec = VecAdd(Result, S1);
-		return res;
-    }
-    
-    __forceinline Quaternion static FromEuler(float x, float y, float z) noexcept
-    {
-        x *= 0.5f; y *= 0.5f; z *= 0.5f;
-        float c[4], s[4];
-        vec_t cv;
-        vec_t sv = VecSinCos(&cv, VecSetR(x, y, z, 1.0f));
-        VecStore(c, cv);
-        VecStore(s, sv);
+        static const int Next[3] = { 1, 2, 0 };
+        i = 0;
+        i += m[1 * numCol + 1] > m[0 * numCol + 0]; // if (M.m[1][1] > M.m[0][0]) i = 1
+        if (m[2 * numCol + 2] > m[i * numCol + i]) i = 2;
+        j = Next[i];
+        k = Next[j];
         
-        Quaternion q;
-        q.w = c[0] * c[1] * c[2] + s[0] * s[1] * s[2];
-        q.x = s[0] * c[1] * c[2] - c[0] * s[1] * s[2];
-        q.y = c[0] * s[1] * c[2] + s[0] * c[1] * s[2];
-        q.z = c[0] * c[1] * s[2] - s[0] * s[1] * c[2];
+        root = Sqrt(m[i * numCol + i] - m[j * numCol + j] - m[k * numCol + k] + 1.0f);
+        
+        Orientation[i] = 0.5f * root;
+        root = 0.5f / root;
+        Orientation[j] = root * (m[i * numCol + j] + m[j * numCol + i]);
+        Orientation[k] = root * (m[i * numCol + k] + m[k * numCol + i]);
+        Orientation[3] = root * (m[j * numCol + k] - m[k*numCol+j]);
+    } 
+}
+
+template<int numCol = 4> // number of columns of matrix, 3 or 4
+void MatrixFromQuaternion(float* mat, Quaternion quat)
+{
+    xyzw q;
+    VecStore(&q.x, quat);
+    const float num9 = q.x * q.x, num8 = q.y * q.y,
+                num7 = q.z * q.z, num6 = q.x * q.y,
+                num5 = q.z * q.w, num4 = q.z * q.x,
+                num3 = q.y * q.w, num2 = q.y * q.z,
+                num  = q.x * q.w;
+
+    mat[numCol * 0 + 0] = 1.0f - (2.0f * (num8 + num7));
+    mat[numCol * 0 + 1] = 2.0f * (num6 + num5);
+    mat[numCol * 0 + 2] = 2.0f * (num4 - num3);
+    
+    mat[numCol * 1 + 0] = 2.0f * (num6 - num5);
+    mat[numCol * 1 + 1] = 1.0f - (2.0f * (num7 + num9));
+    mat[numCol * 1 + 2] = 2.0f * (num2 + num);
+    
+    mat[numCol * 2 + 0] = 2.0f * (num4 + num3);
+    mat[numCol * 2 + 1] = 2.0f * (num2 - num);
+    mat[numCol * 2 + 2] = 1.0f - (2.0f * (num8 + num9));
+    
+    if_constexpr(numCol == 4)
+        mat[numCol * 3 + 3] = 1.0f;
+}
+
+inline Quaternion QFromLookRotation(Vector3f direction, const Vector3f& up)
+{
+    Vector3f matrix[3] = {
+        Vector3f::Cross(up, direction), up, direction 
+    };
+    xyzw result;
+    QuaternionFromMatrix<3>(&result.x, &matrix[0].x);
+    return VecLoad(&result.x);
+}
+
+purefn Quaternion VECTORCALL QConjugate(Quaternion vec)
+{
+    return VecMul(vec, VecSetR(-1.0f, -1.0f, -1.0f, 1.0f));
+}
+
+inline Quaternion QInverse(Quaternion q)
+{
+    const float lengthSq = VecDotf(q, q);
+    if (AlmostEqual(lengthSq, 1.0f))
+    {
+        q = QConjugate(q);
         return q;
     }
-    
-    inline Vector3f static ToEulerAngles(const Quaternion& q) noexcept {
-        Vector3f eulerAngles; // using std is recommended
-        eulerAngles.x = ATan2(2.0f * (q.y * q.z + q.w * q.x), q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z);
-        eulerAngles.y = ASin(Clamp(-2.0f * (q.x * q.z - q.w * q.y), -1.0f, 1.0f));
-        eulerAngles.z = ATan2(2.0f * (q.x * q.y + q.w * q.z), q.w * q.w + q.x * q.x - q.y * q.y - q.z * q.z);
-        return eulerAngles;
-    }
-    
-    __forceinline Quaternion static VECTORCALL FromEuler(Vector3f euler) noexcept
+    else if (lengthSq >= 0.001f)
     {
-    	return FromEuler(euler.x, euler.y, euler.z);
+        q = VecMul(QConjugate(q), VecSet1(1.0f / lengthSq));
+        return q;
     }
-    
-    static inline Quaternion FromLookRotation(Vector3f direction, const Vector3f& up)
+    else
     {
-        Quaternion result;
-        Vector3f matrix[3] {
-            Vector3f::Cross(up, direction), up, direction  
-        };
-        QuaternionFromMatrix<3>(&result.x, &matrix[0].x);
-        return result;
+    	return QIdentity();
     }
-    
-    __forceinline static Quaternion Inverse(Quaternion q)
-    {
-        const float lengthSq = VecDotf(q.vec, q.vec);
-        if (lengthSq == 1.0f)
-        {
-            q.vec = Conjugate(q.vec);
-            return q;
-        }
-        else if (lengthSq >= 0.001f)
-        {
-            q.vec = VecMul(Conjugate(q.vec), VecSet1(1.0f / lengthSq));
-            return q;
-        }
-        else
-        {
-        	return Identity();
-        }
-    }
-    
-    __forceinline Quaternion Inversed() const
-    {
-        return Inverse(*this);
-    }
-    
-    __forceinline static vec_t VECTORCALL Conjugate(const vec_t vec)
-    {
-        static const vec_t NegativeOne3 = VecSetR(-1.0f,-1.0f,-1.0f, 1.0f);
-        return VecMul(vec, NegativeOne3);
-    }
-    
-    __forceinline static Quaternion VECTORCALL Conjugate(const Quaternion vec)
-    {
-        static const Quaternion NegativeOne3 = {-1.0f, -1.0f, -1.0f, 1.0f};
-        return vec * NegativeOne3;
-    }
-    
-    Vector3f GetForward() const {
-        Vector3f res;
-        Vec3Store(&res.x, MulVec3(VecSetR( 0.0f, 0.0f, -1.0f, 0.0f), Conjugate(vec)));
-        return res; 
-    }
-    
-    Vector3f GetRight() const {
-        Vector3f res;
-        Vec3Store(&res.x, MulVec3(VecSetR( 1.0f, 0.0f, 0.0f, 0.0f), Conjugate(vec)));
-        return res; 
-    }
-    
-    Vector3f GetLeft() const {
-        Vector3f res;
-        Vec3Store(&res.x, MulVec3(VecSetR(-1.0f, 0.0f, 0.0f, 0.0f), Conjugate(vec))); 
-        return res; 
-    }
-    
-    Vector3f GetUp() const {
-        Vector3f res;
-        Vec3Store(&res.x, MulVec3(VecSetR( 0.0f, 1.0f, 0.0f, 0.0f), Conjugate(vec)));
-        return res; 
-    }
-    
-    __forceinline Quaternion operator *  (float b)             const { Quaternion q; q.vec = VecMul(this->vec, VecSet1(b)); return q; }
-    __forceinline Quaternion operator *= (float b)                   { this->vec = Mul(this->vec, VecSet1(b)); return *this; }
-    __forceinline Quaternion operator *  (const Quaternion& b) const { Quaternion q; q.vec = Mul(this->vec, b.vec); return q; }
-    __forceinline Quaternion operator *= (const Quaternion& b)       { this->vec = Mul(this->vec, b.vec); return *this; }
-    __forceinline Quaternion operator +  (const Quaternion& b) const { Quaternion q; q.vec = VecAdd(vec, b.vec); return q; }
-    __forceinline Quaternion operator += (const Quaternion& b)       { vec = VecAdd(vec, b.vec); return *this; }
-};
-
-__forceinline Quaternion MakeQuat(float scale = 0.0f)
-{
-    Quaternion v;
-    v.vec = VecSet1(scale);
-    return v;
 }
 
-__forceinline Quaternion MakeQuat(float _x, float _y, float _z, float _w) 
-{
-    Quaternion v;
-    v.vec = VecSetR(_x, _y, _z, _w);
-    return v; 
+inline Vector3f VECTORCALL QGetForward(Quaternion vec) {
+    Vector3f res;
+    Vec3Store(&res.x, QMulVec3(VecSetR( 0.0f, 0.0f, 1.0f, 0.0f), QConjugate(vec)));
+    return res; 
 }
 
-__forceinline Quaternion MakeQuat(const float* _x)
-{
-    Quaternion v;
-    v.vec = VecLoad(_x);
-    return v;
+inline Vector3f VECTORCALL QGetRight(Quaternion vec) {
+    Vector3f res;
+    Vec3Store(&res.x, QMulVec3(VecSetR( 1.0f, 0.0f, 0.0f, 0.0f), QConjugate(vec)));
+    return res; 
 }
 
+inline Vector3f VECTORCALL QGetLeft(Quaternion vec) {
+    Vector3f res;
+    Vec3Store(&res.x, QMulVec3(VecSetR(-1.0f, 0.0f, 0.0f, 0.0f), QConjugate(vec)));
+    return res; 
+}
+
+inline Vector3f VECTORCALL QGetUp(Quaternion vec) {
+    Vector3f res;
+    Vec3Store(&res.x, QMulVec3(VecSetR( 0.0f, 1.0f, 0.0f, 0.0f), QConjugate(vec)));
+    return res; 
+}
 
 AX_END_NAMESPACE 
